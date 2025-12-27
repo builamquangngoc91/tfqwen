@@ -7,7 +7,7 @@ from trl import SFTTrainer
 # ------------------------
 # Model
 # ------------------------
-model_name = "Qwen/Qwen2-0.5B-Instruct"   # you can switch to Qwen2-1.5B for smaller GPU
+model_name = "Qwen/Qwen2-7B-Instruct"   # you can switch to Qwen2-1.5B for smaller GPU
 
 tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
 tokenizer.pad_token = tokenizer.eos_token
