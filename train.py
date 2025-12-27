@@ -15,9 +15,12 @@ tokenizer.pad_token = tokenizer.eos_token
 model = AutoModelForCausalLM.from_pretrained(
     model_name,
     torch_dtype=torch.float16,
-    device_map="auto",
+    device_map={"": 0}, 
     trust_remote_code=True
 )
+
+model.gradient_checkpointing_enable()
+model.config.use_cache = False
 
 # ------------------------
 # LoRA Config
@@ -72,7 +75,7 @@ def tokenize_fn(example):
         text,
         truncation=True,
         max_length=MAX_LEN,
-        padding="max_length"
+        padding=False,
     )
     tokens["labels"] = tokens["input_ids"].copy()
     return tokens
@@ -87,8 +90,8 @@ print("dataset tokenized.")
 # ------------------------
 args = TrainingArguments(
     output_dir="qwen-dolly-lora-fp16",
-    per_device_train_batch_size=2,
-    gradient_accumulation_steps=8,
+    per_device_train_batch_size=1,
+    gradient_accumulation_steps=16,
     learning_rate=2e-4,
     num_train_epochs=2,
     fp16=True,
