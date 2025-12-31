@@ -121,17 +121,16 @@ args = TrainingArguments(
     logging_steps=10,
     save_steps=200,
     save_total_limit=2,
-    report_to="none"
+    report_to="none",
+    remove_unused_columns=False,     # ✅ required
 )
 
-# ------------------------
-# Trainer
-# ------------------------
 trainer = SFTTrainer(
     model=model,
     train_dataset=dataset,
     args=args,
     data_collator=collate_fn,
+    dataset_text_field="text",       # ✅ helpful
 )
 
 trainer.train()
