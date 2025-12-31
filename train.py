@@ -16,7 +16,7 @@ if processor.tokenizer.pad_token is None:
 model = AutoModelForVision2Seq.from_pretrained(
     model_name,
     torch_dtype=torch.float16,
-    device_map="auto",
+    device_map={"": 0},
     trust_remote_code=True
 )
 
