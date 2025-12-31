@@ -1,4 +1,3 @@
-import os
 import torch
 from datasets import load_dataset
 from transformers import AutoModelForVision2Seq, AutoProcessor, TrainingArguments
@@ -6,20 +5,20 @@ from peft import LoraConfig, get_peft_model
 from trl import SFTTrainer
 
 # ------------------------
-# Model (Qwen2-VL)
+# Model
 # ------------------------
-model_name = "Qwen/Qwen2-VL-2B-Instruct"  # or "Qwen/Qwen2-VL-7B-Instruct"
+model_name = "Qwen/Qwen2-VL-2B-Instruct"  # switch to 7B if GPU strong
 
 processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
 
-# Fix pad token if missing
+# pad token fix
 if processor.tokenizer.pad_token is None:
     processor.tokenizer.pad_token = processor.tokenizer.eos_token
 
 model = AutoModelForVision2Seq.from_pretrained(
     model_name,
     torch_dtype=torch.float16,
-    device_map={"": 0},
+    device_map="auto",
     trust_remote_code=True
 )
 
@@ -37,50 +36,51 @@ lora_config = LoraConfig(
     task_type="CAUSAL_LM",
     target_modules=["q_proj", "k_proj", "v_proj", "o_proj"]
 )
+
 model = get_peft_model(model, lora_config)
 print("✅ LoRA attached.")
 
 # ------------------------
-# Load Dataset
+# Load Small Dataset (VQA Medical)
 # ------------------------
-dataset_name = "adamo1139/llava-instruct-150k-with-images"
-dataset = load_dataset(dataset_name, split="train")
+dataset = load_dataset("Areeb-02/VQA-Medical", split="train")
+dataset = dataset.shuffle(seed=42).select(range(2000))
 
 print("✅ Dataset loaded:", dataset)
-
-# Dataset has:
-# - image: PIL Image
-# - conversations: list of dicts with keys {from, value}
-# Image paths are inside zip; dataset card mentions two JSON formats.  [oai_citation:2‡Hugging Face](https://huggingface.co/datasets/adamo1139/llava-instruct-150k-with-images?utm_source=chatgpt.com)
+print("✅ Example keys:", dataset[0].keys())
 
 # ------------------------
-# Convert LLaVA Conversations -> Qwen2-VL Chat format
+# Convert VQA -> Qwen2-VL chat format
 # ------------------------
-def format_llava(example):
+def format_vqa(example):
     image = example["image"]
-    convs = example["conversations"]
+    question = example["question"]
+    answer = example["answer"]
 
-    qwen_messages = []
-    for turn in convs:
-        role = "user" if turn["from"] == "human" else "assistant"
-        text = turn["value"].replace("<image>", "").strip()
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image"},
+                {"type": "text", "text": question.strip()}
+            ]
+        },
+        {"role": "assistant", "content": str(answer).strip()},
+    ]
 
-        if role == "user":
-            qwen_messages.append({
-                "role": "user",
-                "content": [{"type": "image"}, {"type": "text", "text": text}]
-            })
-        else:
-            qwen_messages.append({"role": "assistant", "content": text})
+    text = processor.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=False
+    )
 
-    text = processor.apply_chat_template(qwen_messages, tokenize=False)
     return {"text": text, "image": image}
 
-dataset = dataset.map(format_llava, remove_columns=dataset.column_names)
-print("✅ Dataset converted.")
+dataset = dataset.map(format_vqa, remove_columns=dataset.column_names)
+print("✅ Dataset formatted:", dataset)
 
 # ------------------------
-# Collator: Multimodal batching
+# Collator: multimodal batching
 # ------------------------
 MAX_LEN = 1024
 
@@ -94,25 +94,24 @@ def collate_fn(batch):
         padding=True,
         truncation=True,
         max_length=MAX_LEN,
-        return_tensors="pt",
+        return_tensors="pt"
     )
 
     labels = inputs["input_ids"].clone()
     labels[labels == processor.tokenizer.pad_token_id] = -100
     inputs["labels"] = labels
 
-    # Move to model device
     return {k: v.to(model.device) for k, v in inputs.items()}
 
 # ------------------------
-# Training args
+# Training args (FP16)
 # ------------------------
 args = TrainingArguments(
-    output_dir="qwen2vl-llava-lora-fp16",
+    output_dir="qwen2vl-vqa-medical-lora-fp16",
     per_device_train_batch_size=1,
-    gradient_accumulation_steps=8,   # 16 if GPU is small
+    gradient_accumulation_steps=8,
     learning_rate=2e-4,
-    num_train_epochs=1,              # dataset is big → start with 1 epoch
+    num_train_epochs=2,
     fp16=True,
     logging_steps=10,
     save_steps=200,
@@ -135,6 +134,7 @@ trainer.train()
 # ------------------------
 # Save
 # ------------------------
-model.save_pretrained("qwen2vl-llava-lora-fp16")
-processor.save_pretrained("qwen2vl-llava-lora-fp16")
-print("✅ Saved to qwen2vl-llava-lora-fp16")
+model.save_pretrained("qwen2vl-vqa-medical-lora-fp16")
+processor.save_pretrained("qwen2vl-vqa-medical-lora-fp16")
+
+print("✅ Training complete. Saved to qwen2vl-vqa-medical-lora-fp16")
