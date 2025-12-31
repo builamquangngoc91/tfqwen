@@ -5,18 +5,21 @@ from peft import LoraConfig, get_peft_model
 from trl import SFTTrainer
 
 # ------------------------
-# Model
+# Model (Qwen2-VL)
 # ------------------------
-model_name = "Qwen/Qwen2-VL-2B-Instruct"  # use 7B if GPU strong
+model_name = "Qwen/Qwen2-VL-2B-Instruct"
 
 processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
+
+# Fix PAD token if missing
 if processor.tokenizer.pad_token is None:
     processor.tokenizer.pad_token = processor.tokenizer.eos_token
 
+# ✅ Use single GPU to avoid device_map auto sharding issues
 model = AutoModelForVision2Seq.from_pretrained(
     model_name,
     torch_dtype=torch.float16,
-    device_map={"": 0},
+    device_map={"": 0},   # ✅ force model on GPU 0
     trust_remote_code=True
 )
 
@@ -34,33 +37,29 @@ lora_config = LoraConfig(
     task_type="CAUSAL_LM",
     target_modules=["q_proj", "k_proj", "v_proj", "o_proj"]
 )
+
 model = get_peft_model(model, lora_config)
 print("✅ LoRA attached.")
 
 # ------------------------
-# Load Dataset (Small + Public)
+# Load small dataset (VQA-RAD)
 # ------------------------
 dataset = load_dataset("flaviagiammarino/vqa-rad", split="train")
 dataset = dataset.shuffle(seed=42)
 
-# small subset
+# Take small dataset (≤ 2000)
 dataset = dataset.select(range(min(2000, len(dataset))))
+
 print("✅ Dataset loaded:", dataset)
 print("✅ Example keys:", dataset[0].keys())
 
 # ------------------------
-# Convert VQA -> Qwen2-VL chat format
+# Convert VQA format -> Qwen2-VL Chat format
 # ------------------------
 def format_vqa(example):
     image = example["image"]
-
-    # robust field names
-    question = example.get("question") or example.get("query") or example.get("prompt")
-    answer = example.get("answer") or example.get("label") or example.get("answers")
-
-    # if answers is a list, take first
-    if isinstance(answer, (list, tuple)):
-        answer = answer[0]
+    question = example["question"]
+    answer = example["answer"]
 
     messages = [
         {
@@ -85,7 +84,7 @@ dataset = dataset.map(format_vqa, remove_columns=dataset.column_names)
 print("✅ Dataset formatted:", dataset)
 
 # ------------------------
-# Collator: multimodal batching
+# Data Collator (IMPORTANT)
 # ------------------------
 MAX_LEN = 1024
 
@@ -106,10 +105,11 @@ def collate_fn(batch):
     labels[labels == processor.tokenizer.pad_token_id] = -100
     inputs["labels"] = labels
 
-    return {k: v.to(model.device) for k, v in inputs.items()}
+    # ✅ MUST return CPU tensors (avoids pin_memory CUDA crash)
+    return {k: v.cpu() for k, v in inputs.items()}
 
 # ------------------------
-# Training args (FP16)
+# Training Arguments
 # ------------------------
 args = TrainingArguments(
     output_dir="qwen2vl-vqa-rad-lora-fp16",
@@ -122,16 +122,26 @@ args = TrainingArguments(
     save_steps=200,
     save_total_limit=2,
     report_to="none",
-    remove_unused_columns=False,     # ✅ required
+
+    # ✅ MUST
+    remove_unused_columns=False,
+    dataloader_pin_memory=False,
 )
 
+# ------------------------
+# Trainer
+# ------------------------
 trainer = SFTTrainer(
     model=model,
     train_dataset=dataset,
     args=args,
     data_collator=collate_fn,
+    dataset_text_field="text",  # ✅ helps TRL
 )
 
+# ------------------------
+# Train
+# ------------------------
 trainer.train()
 
 # ------------------------
