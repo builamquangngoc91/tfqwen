@@ -7,7 +7,7 @@ from trl import SFTTrainer
 # =========================================================
 # 1) MODEL: Qwen2-VL
 # =========================================================
-model_name = "Qwen/Qwen2-VL-2B-Instruct"
+model_name = "Qwen/Qwen2-VL-7B-Instruct"
 
 processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
 
