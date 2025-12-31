@@ -60,38 +60,21 @@ def format_llava(example):
     image = example["image"]
     convs = example["conversations"]
 
-    # LLaVA uses:
-    # from: "human" / "gpt"
-    # value: text, sometimes includes "<image>"
     qwen_messages = []
-
     for turn in convs:
         role = "user" if turn["from"] == "human" else "assistant"
         text = turn["value"].replace("<image>", "").strip()
 
         if role == "user":
-            # Qwen2-VL expects user content as list with image + text
             qwen_messages.append({
                 "role": "user",
-                "content": [
-                    {"type": "image"},
-                    {"type": "text", "text": text}
-                ]
+                "content": [{"type": "image"}, {"type": "text", "text": text}]
             })
         else:
-            qwen_messages.append({
-                "role": "assistant",
-                "content": text
-            })
+            qwen_messages.append({"role": "assistant", "content": text})
 
-    # Apply chat template (text only here; image passed separately in collator)
-    chat_text = processor.apply_chat_template(
-        qwen_messages,
-        tokenize=False,
-        add_generation_prompt=False
-    )
-
-    return {"text": chat_text, "image": image}
+    text = processor.apply_chat_template(qwen_messages, tokenize=False)
+    return {"text": text, "image": image}
 
 dataset = dataset.map(format_llava, remove_columns=dataset.column_names)
 print("✅ Dataset converted.")
