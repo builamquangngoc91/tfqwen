@@ -1,21 +1,25 @@
+import os
 import torch
 from datasets import load_dataset
-from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments
+from transformers import AutoModelForVision2Seq, AutoProcessor, TrainingArguments
 from peft import LoraConfig, get_peft_model
 from trl import SFTTrainer
 
 # ------------------------
-# Model
+# Model (Qwen2-VL)
 # ------------------------
-model_name = "Qwen/Qwen2-7B-Instruct"   # you can switch to Qwen2-1.5B for smaller GPU
+model_name = "Qwen/Qwen2-VL-2B-Instruct"  # or "Qwen/Qwen2-VL-7B-Instruct"
 
-tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-tokenizer.pad_token = tokenizer.eos_token
+processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
 
-model = AutoModelForCausalLM.from_pretrained(
+# Fix pad token if missing
+if processor.tokenizer.pad_token is None:
+    processor.tokenizer.pad_token = processor.tokenizer.eos_token
+
+model = AutoModelForVision2Seq.from_pretrained(
     model_name,
     torch_dtype=torch.float16,
-    device_map={"": 0}, 
+    device_map={"": 0},
     trust_remote_code=True
 )
 
@@ -33,67 +37,99 @@ lora_config = LoraConfig(
     task_type="CAUSAL_LM",
     target_modules=["q_proj", "k_proj", "v_proj", "o_proj"]
 )
-
 model = get_peft_model(model, lora_config)
-
-print("Initializing LoRA parameters...")
-
-
-dataset = load_dataset("databricks/databricks-dolly-15k", split="train")
+print("✅ LoRA attached.")
 
 # ------------------------
-# Convert Dolly -> Qwen chat format
+# Load Dataset
 # ------------------------
-def format_dolly(example):
-    instruction = example["instruction"]
-    context = example.get("context", "")
-    response = example["response"]
+dataset_name = "adamo1139/llava-instruct-150k-with-images"
+dataset = load_dataset(dataset_name, split="train")
 
-    user_msg = instruction.strip()
-    if context and len(context.strip()) > 0:
-        user_msg += "\n\nContext:\n" + context.strip()
+print("✅ Dataset loaded:", dataset)
 
-    messages = [
-        {"role": "user", "content": user_msg},
-        {"role": "assistant", "content": response.strip()},
-    ]
+# Dataset has:
+# - image: PIL Image
+# - conversations: list of dicts with keys {from, value}
+# Image paths are inside zip; dataset card mentions two JSON formats.  [oai_citation:2‡Hugging Face](https://huggingface.co/datasets/adamo1139/llava-instruct-150k-with-images?utm_source=chatgpt.com)
 
-    return tokenizer.apply_chat_template(
-        messages,
+# ------------------------
+# Convert LLaVA Conversations -> Qwen2-VL Chat format
+# ------------------------
+def format_llava(example):
+    image = example["image"]
+    convs = example["conversations"]
+
+    # LLaVA uses:
+    # from: "human" / "gpt"
+    # value: text, sometimes includes "<image>"
+    qwen_messages = []
+
+    for turn in convs:
+        role = "user" if turn["from"] == "human" else "assistant"
+        text = turn["value"].replace("<image>", "").strip()
+
+        if role == "user":
+            # Qwen2-VL expects user content as list with image + text
+            qwen_messages.append({
+                "role": "user",
+                "content": [
+                    {"type": "image"},
+                    {"type": "text", "text": text}
+                ]
+            })
+        else:
+            qwen_messages.append({
+                "role": "assistant",
+                "content": text
+            })
+
+    # Apply chat template (text only here; image passed separately in collator)
+    chat_text = processor.apply_chat_template(
+        qwen_messages,
         tokenize=False,
         add_generation_prompt=False
     )
 
-# ------------------------
-# Tokenize dataset (old TRL-friendly)
-# ------------------------
-MAX_LEN = 1024  # ✅ small dataset -> 1024 is enough; use 2048 if GPU is strong
+    return {"text": chat_text, "image": image}
 
-def tokenize_fn(example):
-    text = format_dolly(example)
-    tokens = tokenizer(
-        text,
+dataset = dataset.map(format_llava, remove_columns=dataset.column_names)
+print("✅ Dataset converted.")
+
+# ------------------------
+# Collator: Multimodal batching
+# ------------------------
+MAX_LEN = 1024
+
+def collate_fn(batch):
+    texts = [x["text"] for x in batch]
+    images = [x["image"] for x in batch]
+
+    inputs = processor(
+        text=texts,
+        images=images,
+        padding=True,
         truncation=True,
         max_length=MAX_LEN,
-        padding=False,
+        return_tensors="pt",
     )
-    tokens["labels"] = tokens["input_ids"].copy()
-    return tokens
 
-tokenized_dataset = dataset.map(tokenize_fn, remove_columns=dataset.column_names)
+    labels = inputs["input_ids"].clone()
+    labels[labels == processor.tokenizer.pad_token_id] = -100
+    inputs["labels"] = labels
 
-print("dataset tokenized.")
-
+    # Move to model device
+    return {k: v.to(model.device) for k, v in inputs.items()}
 
 # ------------------------
-# Training args (FP16)
+# Training args
 # ------------------------
 args = TrainingArguments(
-    output_dir="qwen-dolly-lora-fp16",
+    output_dir="qwen2vl-llava-lora-fp16",
     per_device_train_batch_size=1,
-    gradient_accumulation_steps=16,
+    gradient_accumulation_steps=8,   # 16 if GPU is small
     learning_rate=2e-4,
-    num_train_epochs=2,
+    num_train_epochs=1,              # dataset is big → start with 1 epoch
     fp16=True,
     logging_steps=10,
     save_steps=200,
@@ -101,14 +137,21 @@ args = TrainingArguments(
     report_to="none"
 )
 
-
+# ------------------------
+# Trainer
+# ------------------------
 trainer = SFTTrainer(
     model=model,
-    train_dataset=tokenized_dataset,
+    train_dataset=dataset,
     args=args,
+    data_collator=collate_fn,
 )
 
 trainer.train()
 
-model.save_pretrained("qwen-dolly-lora-fp16")
-tokenizer.save_pretrained("qwen-dolly-lora-fp16")
+# ------------------------
+# Save
+# ------------------------
+model.save_pretrained("qwen2vl-llava-lora-fp16")
+processor.save_pretrained("qwen2vl-llava-lora-fp16")
+print("✅ Saved to qwen2vl-llava-lora-fp16")
