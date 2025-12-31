@@ -136,7 +136,6 @@ trainer = SFTTrainer(
     train_dataset=dataset,
     args=args,
     data_collator=collate_fn,
-    dataset_text_field="text",  # ✅ helps TRL
 )
 
 # ------------------------
