@@ -7,11 +7,9 @@ from trl import SFTTrainer
 # ------------------------
 # Model
 # ------------------------
-model_name = "Qwen/Qwen2-VL-2B-Instruct"  # switch to 7B if GPU strong
+model_name = "Qwen/Qwen2-VL-2B-Instruct"  # use 7B if GPU strong
 
 processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
-
-# pad token fix
 if processor.tokenizer.pad_token is None:
     processor.tokenizer.pad_token = processor.tokenizer.eos_token
 
@@ -36,16 +34,17 @@ lora_config = LoraConfig(
     task_type="CAUSAL_LM",
     target_modules=["q_proj", "k_proj", "v_proj", "o_proj"]
 )
-
 model = get_peft_model(model, lora_config)
 print("✅ LoRA attached.")
 
 # ------------------------
-# Load Small Dataset (VQA Medical)
+# Load Dataset (Small + Public)
 # ------------------------
-dataset = load_dataset("Areeb-02/VQA-Medical", split="train")
-dataset = dataset.shuffle(seed=42).select(range(2000))
+dataset = load_dataset("flaviagiammarino/vqa-rad", split="train")
+dataset = dataset.shuffle(seed=42)
 
+# small subset
+dataset = dataset.select(range(min(2000, len(dataset))))
 print("✅ Dataset loaded:", dataset)
 print("✅ Example keys:", dataset[0].keys())
 
@@ -54,8 +53,14 @@ print("✅ Example keys:", dataset[0].keys())
 # ------------------------
 def format_vqa(example):
     image = example["image"]
-    question = example["question"]
-    answer = example["answer"]
+
+    # robust field names
+    question = example.get("question") or example.get("query") or example.get("prompt")
+    answer = example.get("answer") or example.get("label") or example.get("answers")
+
+    # if answers is a list, take first
+    if isinstance(answer, (list, tuple)):
+        answer = answer[0]
 
     messages = [
         {
@@ -107,7 +112,7 @@ def collate_fn(batch):
 # Training args (FP16)
 # ------------------------
 args = TrainingArguments(
-    output_dir="qwen2vl-vqa-medical-lora-fp16",
+    output_dir="qwen2vl-vqa-rad-lora-fp16",
     per_device_train_batch_size=1,
     gradient_accumulation_steps=8,
     learning_rate=2e-4,
@@ -134,7 +139,7 @@ trainer.train()
 # ------------------------
 # Save
 # ------------------------
-model.save_pretrained("qwen2vl-vqa-medical-lora-fp16")
-processor.save_pretrained("qwen2vl-vqa-medical-lora-fp16")
+model.save_pretrained("qwen2vl-vqa-rad-lora-fp16")
+processor.save_pretrained("qwen2vl-vqa-rad-lora-fp16")
 
-print("✅ Training complete. Saved to qwen2vl-vqa-medical-lora-fp16")
+print("✅ Training complete. Saved to qwen2vl-vqa-rad-lora-fp16")
