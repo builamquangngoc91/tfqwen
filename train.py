@@ -4,31 +4,31 @@ from transformers import AutoModelForVision2Seq, AutoProcessor, TrainingArgument
 from peft import LoraConfig, get_peft_model
 from trl import SFTTrainer
 
-# ------------------------
-# Model (Qwen2-VL)
-# ------------------------
+# =========================================================
+# 1) MODEL: Qwen2-VL
+# =========================================================
 model_name = "Qwen/Qwen2-VL-2B-Instruct"
 
 processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
 
-# Fix PAD token if missing
+# Ensure PAD token exists
 if processor.tokenizer.pad_token is None:
     processor.tokenizer.pad_token = processor.tokenizer.eos_token
 
-# ✅ Use single GPU to avoid device_map auto sharding issues
+# Force model on 1 GPU to avoid weird device_map sharding issues
 model = AutoModelForVision2Seq.from_pretrained(
     model_name,
     torch_dtype=torch.float16,
-    device_map={"": 0},   # ✅ force model on GPU 0
+    device_map={"": 0},
     trust_remote_code=True
 )
 
 model.gradient_checkpointing_enable()
 model.config.use_cache = False
 
-# ------------------------
-# LoRA Config
-# ------------------------
+# =========================================================
+# 2) LORA
+# =========================================================
 lora_config = LoraConfig(
     r=8,
     lora_alpha=16,
@@ -41,21 +41,23 @@ lora_config = LoraConfig(
 model = get_peft_model(model, lora_config)
 print("✅ LoRA attached.")
 
-# ------------------------
-# Load small dataset (VQA-RAD)
-# ------------------------
+# =========================================================
+# 3) DATASET (small VQA dataset)
+# =========================================================
 dataset = load_dataset("flaviagiammarino/vqa-rad", split="train")
 dataset = dataset.shuffle(seed=42)
 
-# Take small dataset (≤ 2000)
+# take at most 2000 (train set has 1793)
 dataset = dataset.select(range(min(2000, len(dataset))))
 
 print("✅ Dataset loaded:", dataset)
 print("✅ Example keys:", dataset[0].keys())
 
-# ------------------------
-# Convert VQA format -> Qwen2-VL Chat format
-# ------------------------
+# =========================================================
+# 4) FORMAT DATASET -> Qwen2-VL chat template
+# =========================================================
+MAX_TEXT_CHARS = 4000  # safety limit, avoids extremely long samples
+
 def format_vqa(example):
     image = example["image"]
     question = example["question"]
@@ -67,7 +69,7 @@ def format_vqa(example):
             "content": [
                 {"type": "image"},
                 {"type": "text", "text": question.strip()}
-            ]
+            ],
         },
         {"role": "assistant", "content": str(answer).strip()},
     ]
@@ -78,26 +80,27 @@ def format_vqa(example):
         add_generation_prompt=False
     )
 
+    # Safety: prevent super long strings
+    text = text[:MAX_TEXT_CHARS]
+
     return {"text": text, "image": image}
 
 dataset = dataset.map(format_vqa, remove_columns=dataset.column_names)
 print("✅ Dataset formatted:", dataset)
 
-# ------------------------
-# Data Collator (IMPORTANT)
-# ------------------------
-MAX_LEN = 1024
-
+# =========================================================
+# 5) COLLATOR (NO truncation!)
+# =========================================================
 def collate_fn(batch):
     texts = [x["text"] for x in batch]
     images = [x["image"] for x in batch]
 
+    # IMPORTANT: DO NOT truncate here, otherwise Qwen2-VL image tokens mismatch
     inputs = processor(
         text=texts,
         images=images,
         padding=True,
-        truncation=True,
-        max_length=MAX_LEN,
+        truncation=False,
         return_tensors="pt"
     )
 
@@ -105,12 +108,12 @@ def collate_fn(batch):
     labels[labels == processor.tokenizer.pad_token_id] = -100
     inputs["labels"] = labels
 
-    # ✅ MUST return CPU tensors (avoids pin_memory CUDA crash)
+    # IMPORTANT: Return CPU tensors only (avoids pin_memory CUDA crash)
     return {k: v.cpu() for k, v in inputs.items()}
 
-# ------------------------
-# Training Arguments
-# ------------------------
+# =========================================================
+# 6) TRAINING ARGS
+# =========================================================
 args = TrainingArguments(
     output_dir="qwen2vl-vqa-rad-lora-fp16",
     per_device_train_batch_size=1,
@@ -123,14 +126,16 @@ args = TrainingArguments(
     save_total_limit=2,
     report_to="none",
 
-    # ✅ MUST
+    # ✅ MUST for multimodal + custom collator
     remove_unused_columns=False,
+
+    # ✅ avoid pin_memory error if any tensor accidentally lands on GPU
     dataloader_pin_memory=False,
 )
 
-# ------------------------
-# Trainer
-# ------------------------
+# =========================================================
+# 7) TRAINER
+# =========================================================
 trainer = SFTTrainer(
     model=model,
     train_dataset=dataset,
@@ -138,15 +143,16 @@ trainer = SFTTrainer(
     data_collator=collate_fn,
 )
 
-# ------------------------
-# Train
-# ------------------------
+# =========================================================
+# 8) TRAIN
+# =========================================================
 trainer.train()
 
-# ------------------------
-# Save
-# ------------------------
-model.save_pretrained("qwen2vl-vqa-rad-lora-fp16")
-processor.save_pretrained("qwen2vl-vqa-rad-lora-fp16")
+# =========================================================
+# 9) SAVE
+# =========================================================
+save_dir = "qwen2vl-vqa-rad-lora-fp16"
+model.save_pretrained(save_dir)
+processor.save_pretrained(save_dir)
 
-print("✅ Training complete. Saved to qwen2vl-vqa-rad-lora-fp16")
+print(f"✅ Training complete. Saved to {save_dir}")
